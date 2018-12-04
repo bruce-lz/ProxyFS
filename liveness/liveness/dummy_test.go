@@ -1,4 +1,4 @@
-package liveness
+package main
 
 import (
 	"testing"

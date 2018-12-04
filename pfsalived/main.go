@@ -106,7 +106,7 @@ func main() {
 
 	args = os.Args[1:]
 
-	// Check that os.Args[1] was supplied... it might be a .conf or an option list (followed by a .conf)
+	// Check that os.Args[1] was supplied...
 	if 0 == len(args) {
 		log.Fatalf("No .conf file specified")
 	}

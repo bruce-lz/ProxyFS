@@ -14,6 +14,7 @@ gopkgsubdirs = \
 	httpserver \
 	inode \
 	jrpcfs \
+	liveness \
 	logger \
 	mkproxyfs \
 	platform \
@@ -30,7 +31,6 @@ gobinsubdirs = \
 	cleanproxyfs \
 	fsworkout \
 	inodeworkout \
-	liveness \
 	pfs-crash \
 	pfs-stress \
 	pfs-swift-load \
@@ -39,6 +39,7 @@ gobinsubdirs = \
 	pfsconfjsonpacked \
 	pfsworkout \
 	evtlog/pfsevtlogd \
+	liveness/liveness \
 	mkproxyfs/mkproxyfs \
 	proxyfsd/proxyfsd \
 	ramswift/ramswift

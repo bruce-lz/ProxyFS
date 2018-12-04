@@ -1,206 +1,20 @@
-package main
+package liveness
 
 import (
 	"crypto/rand"
-	"flag"
 	"fmt"
 	"hash/crc64"
 	"net"
 	"os"
-	"os/signal"
 	"reflect"
-	"strings"
-	"sync"
-	"syscall"
 	"time"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/swiftstack/cstruct"
+
+	"github.com/swiftstack/ProxyFS/logger"
 )
 
-const (
-	udpPacketSizeMin = uint64(1000) // Presumably >> udpPacketHeaderSize
-	udpPacketSizeMax = uint64(8000) // Presumably >> udpPacketHeaderSize
-
-	udpPacketSendSizeDefault = uint64(1400)
-	udpPacketRecvSizeDefault = uint64(1500)
-
-	udpPacketCapPerMessageMin = uint8(1)
-	udpPacketCapPerMessageMax = uint8(10)
-
-	udpPacketCapPerMessageDefault = uint64(5)
-
-	udpPacketHeaderSize uint64 = 8 + 8 + 1 + 1 // sizeof(CRC64) + sizeof(MsgNonce) + sizeof(PacketIndex) + sizeof(PacketCount)
-
-	heartbeatDurationDefault = "1s"
-
-	heartbeatMissLimitMin     = uint64(2)
-	heartbeatMissLimitDefault = uint64(3)
-
-	verbosityNone           = uint64(0) // also the default
-	verbosityStateChanges   = uint64(1)
-	verbosityMessages       = uint64(2)
-	verbosityMessageDetails = uint64(3)
-	verbosityMax            = uint64(4)
-)
-
-// Every msg is cstruct-encoded in cstruct.LittleEndian byte order
-
-type MsgType uint8
-
-const (
-	MsgTypeHeartBeatRequest MsgType = iota
-	MsgTypeHeartBeatResponse
-	MsgTypeRequestVoteRequest
-	MsgTypeRequestVoteResponse
-)
-
-type MsgTypeStruct struct {
-	MsgType MsgType
-}
-
-type HeartBeatRequestStruct struct {
-	MsgType    MsgType // == MsgTypeHeartBeatRequest
-	LeaderTerm uint64
-	Nonce      uint64
-}
-
-type HeartBeatResponseStruct struct {
-	MsgType     MsgType // == MsgTypeHeartBeatResponse
-	CurrentTerm uint64
-	Nonce       uint64
-	Success     bool
-}
-
-type RequestVoteRequestStruct struct {
-	MsgType       MsgType // == MsgTypeRequestVoteRequest
-	CandidateTerm uint64
-}
-
-type RequestVoteResponseStruct struct {
-	MsgType     MsgType // == MsgTypeRequestVoteResponse
-	CurrentTerm uint64
-	VoteGranted bool
-}
-
-type recvMsgQueueElementStruct struct {
-	next    *recvMsgQueueElementStruct
-	prev    *recvMsgQueueElementStruct
-	peer    *peerStruct
-	msgType MsgType     // Even though it's inside msg, make it easier to decode
-	msg     interface{} // Must be a pointer to one of the above Msg structs (other than CommonMsgHeaderStruct)
-}
-
-type peerStruct struct {
-	udpAddr                 *net.UDPAddr
-	curRecvMsgNonce         uint64
-	curRecvPacketCount      uint8
-	curRecvPacketSumSize    uint64
-	curRecvPacketMap        map[uint8][]byte           // Key is PacketIndex
-	prevRecvMsgQueueElement *recvMsgQueueElementStruct // Protected by globalsStruct.sync.Mutex
-	//                                                    Note: Since there is only a single pointer here,
-	//                                                          the total number of buffered received msgs
-	//                                                          is capped by the number of listed peers
-}
-
-type globalsStruct struct {
-	sync.Mutex                 // Protects all of globalsStruct as well as peerStruct.prevRecvMsgQueueElement
-	myUDPAddr                  *net.UDPAddr
-	myUDPConn                  *net.UDPConn
-	peers                      map[string]*peerStruct // Key == peerStruct.udpAddr.String() (~= peerStruct.tuple)
-	udpPacketSendSize          uint64
-	udpPacketSendPayloadSize   uint64
-	udpPacketRecvSize          uint64
-	udpPacketRecvPayloadSize   uint64
-	udpPacketCapPerMessage     uint8
-	sendMsgMessageSizeMax      uint64
-	heartbeatDuration          time.Duration
-	heartbeatMissLimit         uint64
-	heartbeatMissDuration      time.Duration
-	verbosity                  uint64
-	msgTypeBufSize             uint64
-	heartBeatRequestBufSize    uint64
-	heartBeatResponseBufSize   uint64
-	requestVoteRequestBufSize  uint64
-	requestVoteResponseBufSize uint64
-	crc64ECMATable             *crc64.Table
-	nextNonce                  uint64 // Randomly initialized... skips 0
-	recvMsgsDoneChan           chan struct{}
-	recvMsgQueueHead           *recvMsgQueueElementStruct
-	recvMsgQueueTail           *recvMsgQueueElementStruct
-	recvMsgChan                chan struct{}
-	currentLeader              *peerStruct
-	currentVote                *peerStruct
-	currentTerm                uint64
-	nextState                  func()
-}
-
-var globals globalsStruct
-
-func main() {
-	var (
-		err                          error
-		heartbeatDurationStringPtr   *string
-		heartbeatMissLimitU64Ptr     *uint64
-		myTupleStringPtr             *string
-		peerTuplesStringPtr          *string
-		signalChan                   chan os.Signal
-		udpPacketCapPerMessageU64Ptr *uint64
-		udpPacketRecvSizeU64Ptr      *uint64
-		udpPacketSendSizeU64Ptr      *uint64
-		verbosityU64Ptr              *uint64
-	)
-
-	// Parse arguments
-
-	myTupleStringPtr = flag.String("me", "not-supplied", "the Address:UDPPort of this peer")
-	peerTuplesStringPtr = flag.String("peers", "", "comma-separated list of other peers in Address:UDPPort form")
-	udpPacketSendSizeU64Ptr = flag.Uint64("send", udpPacketSendSizeDefault, "max size of a sent UDP packet")
-	udpPacketRecvSizeU64Ptr = flag.Uint64("receive", udpPacketRecvSizeDefault, "max size of a received UDP packet")
-	udpPacketCapPerMessageU64Ptr = flag.Uint64("packets", udpPacketCapPerMessageDefault, "max number of UDP packets per message")
-	heartbeatDurationStringPtr = flag.String("hbrate", heartbeatDurationDefault, "time.Duration for heartbeat rate")
-	heartbeatMissLimitU64Ptr = flag.Uint64("hbmiss", heartbeatMissLimitDefault, "number of heartbeat intervals missed before reelection")
-	verbosityU64Ptr = flag.Uint64("verbosity", verbosityNone, "if non-zero, enables logging to os.Stdout")
-
-	flag.Parse()
-
-	// Initialize globals
-
-	err = initializeGlobals(
-		*myTupleStringPtr,
-		*peerTuplesStringPtr,
-		*udpPacketSendSizeU64Ptr,
-		*udpPacketRecvSizeU64Ptr,
-		*udpPacketCapPerMessageU64Ptr,
-		*heartbeatDurationStringPtr,
-		*heartbeatMissLimitU64Ptr,
-		*verbosityU64Ptr)
-
-	if nil != err {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
-		flag.PrintDefaults()
-		os.Exit(int(syscall.EPERM))
-	}
-
-	if verbosityMax <= globals.verbosity {
-		dumpGlobals("  ")
-	}
-
-	// Set up cleanup signal handler
-
-	signalChan = make(chan os.Signal)
-	signal.Notify(signalChan, unix.SIGINT, unix.SIGTERM)
-	go shutdownSignalHandler(signalChan)
-
-	// Enter processing loop
-
-	for {
-		globals.nextState()
-	}
-}
-
-func initializeGlobals(myTuple string, peerTuples string, udpPacketSendSize uint64, udpPacketRecvSize uint64, udpPacketCapPerMessage uint64, heartbeatDuration string, heartbeatMissLimit uint64, verbosity uint64) (err error) {
+func initializeGlobals(myTuple string, peerTuples []string, udpPacketSendSize uint64, udpPacketRecvSize uint64, udpPacketCapPerMessage uint64, heartbeatDuration string, heartbeatMissLimit uint64, logLevel uint64) (err error) {
 	var (
 		dummyMsgTypeStruct             MsgTypeStruct
 		dummyHeartBeatRequestStruct    HeartBeatRequestStruct
@@ -210,75 +24,66 @@ func initializeGlobals(myTuple string, peerTuples string, udpPacketSendSize uint
 		ok                             bool
 		peer                           *peerStruct
 		peerTuple                      string
-		peerTupleSlice                 []string
 		u64RandBuf                     []byte
 	)
 
 	globals.myUDPAddr, err = net.ResolveUDPAddr("udp", myTuple)
 	if nil != err {
-		err = fmt.Errorf("Cannot parse meTuple (%s): %v", myTuple, err)
+		err = fmt.Errorf("Cannot parse myTuple (%s): %v", myTuple, err)
 		return
 	}
 
 	globals.myUDPConn, err = net.ListenUDP("udp", globals.myUDPAddr)
 	if nil != err {
-		err = fmt.Errorf("Cannot bind to meTuple (%v): %v", globals.myUDPAddr, err)
+		err = fmt.Errorf("Cannot bind to myTuple (%v): %v", globals.myUDPAddr, err)
 		return
 	}
 
 	globals.peers = make(map[string]*peerStruct)
 
-	if "" != peerTuples {
-		peerTupleSlice = strings.Split(peerTuples, ",")
-
-		for _, peerTuple = range peerTupleSlice {
-			if "" == peerTuple {
-				err = fmt.Errorf("No peerTuple can be the empty string")
-				return
-			}
-			peer = &peerStruct{
-				curRecvMsgNonce:         0,
-				curRecvPacketCount:      0,
-				curRecvPacketSumSize:    0,
-				curRecvPacketMap:        nil,
-				prevRecvMsgQueueElement: nil,
-			}
-			peer.udpAddr, err = net.ResolveUDPAddr("udp", peerTuple)
-			if nil != err {
-				err = fmt.Errorf("Cannot parse peerTuple (%s): %v", peerTuple, err)
-				return
-			}
-			if globals.myUDPAddr.String() == peer.udpAddr.String() {
-				err = fmt.Errorf("peerTuples must not contain meTuple (%v)", globals.myUDPAddr)
-				return
-			}
-			_, ok = globals.peers[peer.udpAddr.String()]
-			if ok {
-				err = fmt.Errorf("peerTuples must not contain duplicate peers (%v)", peer.udpAddr)
-				return
-			}
-			globals.peers[peer.udpAddr.String()] = peer
+	for _, peerTuple = range peerTuples {
+		peer = &peerStruct{
+			curRecvMsgNonce:         0,
+			curRecvPacketCount:      0,
+			curRecvPacketSumSize:    0,
+			curRecvPacketMap:        nil,
+			prevRecvMsgQueueElement: nil,
 		}
+		peer.udpAddr, err = net.ResolveUDPAddr("udp", peerTuple)
+		if nil != err {
+			err = fmt.Errorf("Cannot parse peerTuple (%s): %v", peerTuple, err)
+			return
+		}
+		if globals.myUDPAddr.String() == peer.udpAddr.String() {
+			err = fmt.Errorf("peerTuples must not contain myTuple (%v)", globals.myUDPAddr)
+			return
+		}
+		_, ok = globals.peers[peer.udpAddr.String()]
+		if ok {
+			err = fmt.Errorf("peerTuples must not contain duplicate peers (%v)", peer.udpAddr)
+			return
+		}
+		globals.peers[peer.udpAddr.String()] = peer
 	}
 
-	if (udpPacketSendSize < udpPacketSizeMin) || (udpPacketSendSize > udpPacketSizeMax) {
-		err = fmt.Errorf("udpPacketSendSize (%v) must be between %v and %v (inclusive)", udpPacketSendSize, udpPacketSizeMin, udpPacketSizeMax)
+	if (udpPacketSendSize < UDPPacketSizeMin) || (udpPacketSendSize > UDPPacketSizeMax) {
+		err = fmt.Errorf("udpPacketSendSize (%v) must be between %v and %v (inclusive)", udpPacketSendSize, UDPPacketSizeMin, UDPPacketSizeMax)
 		return
 	}
 
 	globals.udpPacketSendSize = udpPacketSendSize
 	globals.udpPacketSendPayloadSize = udpPacketSendSize - udpPacketHeaderSize
 
-	if (udpPacketRecvSize < udpPacketSizeMin) || (udpPacketRecvSize > udpPacketSizeMax) {
-		err = fmt.Errorf("udpPacketRecvSize (%v) must be between %v and %v (inclusive)", udpPacketRecvSize, udpPacketSizeMin, udpPacketSizeMax)
+	if (udpPacketRecvSize < UDPPacketSizeMin) || (udpPacketRecvSize > UDPPacketSizeMax) {
+		err = fmt.Errorf("udpPacketRecvSize (%v) must be between %v and %v (inclusive)", udpPacketRecvSize, UDPPacketSizeMin, UDPPacketSizeMax)
 		return
 	}
 
 	globals.udpPacketRecvSize = udpPacketRecvSize
 	globals.udpPacketRecvPayloadSize = udpPacketRecvSize - udpPacketHeaderSize
 
-	if (udpPacketCapPerMessage < uint64(udpPacketCapPerMessageMin)) || (udpPacketCapPerMessage > uint64(udpPacketCapPerMessageMax)) {
-		err = fmt.Errorf("udpPacketCapPerMessage (%v) must be between %v and %v (inclusive)", udpPacketCapPerMessage, udpPacketCapPerMessageMin, udpPacketCapPerMessageMax)
+	if (udpPacketCapPerMessage < uint64(UDPPacketCapPerMessageMin)) || (udpPacketCapPerMessage > uint64(UDPPacketCapPerMessageMax)) {
+		err = fmt.Errorf("udpPacketCapPerMessage (%v) must be between %v and %v (inclusive)", udpPacketCapPerMessage, UDPPacketCapPerMessageMin, UDPPacketCapPerMessageMax)
 		return
 	}
 
@@ -296,20 +101,20 @@ func initializeGlobals(myTuple string, peerTuples string, udpPacketSendSize uint
 		return
 	}
 
-	if heartbeatMissLimit < heartbeatMissLimitMin {
-		err = fmt.Errorf("heartbeatMissLimit (%v) must be at least %v", heartbeatMissLimit, heartbeatMissLimitMin)
+	if heartbeatMissLimit < HeartBeatMissLimitMin {
+		err = fmt.Errorf("heartbeatMissLimit (%v) must be at least %v", heartbeatMissLimit, HeartBeatMissLimitMin)
 		return
 	}
 
 	globals.heartbeatMissLimit = heartbeatMissLimit
 	globals.heartbeatMissDuration = time.Duration(heartbeatMissLimit) * globals.heartbeatDuration
 
-	if verbosity > verbosityMax {
-		err = fmt.Errorf("verbosity (%v) must be between 0 and %v (inclusive)", verbosity, verbosityMax)
+	if logLevel > LogLevelMax {
+		err = fmt.Errorf("logLevel (%v) must be between 0 and %v (inclusive)", logLevel, LogLevelMax)
 		return
 	}
 
-	globals.verbosity = verbosity
+	globals.logLevel = logLevel
 
 	globals.msgTypeBufSize, _, err = cstruct.Examine(dummyMsgTypeStruct)
 	if nil != err {
@@ -699,11 +504,11 @@ func recvMsgs() {
 
 			globals.recvMsgChan <- struct{}{}
 
-			if verbosityMessages <= globals.verbosity {
-				if verbosityMessageDetails > globals.verbosity {
-					fmt.Printf("[%s] %s rec'd %s from %s\n", time.Now().Format(time.RFC3339), globals.myUDPAddr, reflect.TypeOf(recvMsgQueueElement.msg), udpAddr)
+			if LogLevelMessages <= globals.logLevel {
+				if LogLevelMessageDetails > globals.logLevel {
+					logger.Infof("%s rec'd %s from %s", globals.myUDPAddr, reflect.TypeOf(recvMsgQueueElement.msg), udpAddr)
 				} else {
-					fmt.Printf("[%s] %s rec'd %s from %s [%#v]\n", time.Now().Format(time.RFC3339), globals.myUDPAddr, reflect.TypeOf(recvMsgQueueElement.msg), udpAddr, recvMsgQueueElement.msg)
+					logger.Infof("%s rec'd %s from %s [%#v]", globals.myUDPAddr, reflect.TypeOf(recvMsgQueueElement.msg), udpAddr, recvMsgQueueElement.msg)
 				}
 			}
 		}
@@ -715,6 +520,7 @@ func sendMsg(peer *peerStruct, msg interface{}) (peers []*peerStruct, err error)
 	var (
 		computedCRC64    uint64
 		computedCRC64Buf []byte
+		loggerInfofBuf   string
 		msgBuf           []byte
 		msgBufOffset     uint64
 		msgBufSize       uint64
@@ -791,15 +597,15 @@ func sendMsg(peer *peerStruct, msg interface{}) (peers []*peerStruct, err error)
 		}
 	}
 
-	if verbosityMessages <= globals.verbosity {
-		fmt.Printf("[%s] %s sent %s to", time.Now().Format(time.RFC3339), globals.myUDPAddr, reflect.TypeOf(msg))
+	if LogLevelMessages <= globals.logLevel {
+		loggerInfofBuf = fmt.Sprintf("%s sent %s to", globals.myUDPAddr, reflect.TypeOf(msg))
 		for _, peer = range peers {
-			fmt.Printf(" %s", peer.udpAddr)
+			loggerInfofBuf = loggerInfofBuf + fmt.Sprintf(" %s", peer.udpAddr)
 		}
-		if verbosityMessageDetails <= globals.verbosity {
-			fmt.Printf(" [%#v]", msg)
+		if LogLevelMessageDetails <= globals.logLevel {
+			loggerInfofBuf = loggerInfofBuf + fmt.Sprintf(" [%#v]", msg)
 		}
-		fmt.Println()
+		logger.Info(loggerInfofBuf)
 	}
 
 	err = nil
@@ -827,8 +633,8 @@ func doCandidate() {
 		timeNow                                         time.Time
 	)
 
-	if verbosityStateChanges <= globals.verbosity {
-		fmt.Printf("[%s] %s entered Candidate state\n", time.Now().Format(time.RFC3339), globals.myUDPAddr)
+	if LogLevelStateChanges <= globals.logLevel {
+		logger.Infof("%s entered Candidate state", globals.myUDPAddr)
 	}
 
 	globals.currentTerm++
@@ -995,8 +801,8 @@ func doFollower() {
 		timeNow                        time.Time
 	)
 
-	if verbosityStateChanges <= globals.verbosity {
-		fmt.Printf("[%s] %s entered Follower state\n", time.Now().Format(time.RFC3339), globals.myUDPAddr)
+	if LogLevelStateChanges <= globals.logLevel {
+		logger.Infof("%s entered Follower state", globals.myUDPAddr)
 	}
 
 	heartbeatMissTime = time.Now().Add(globals.heartbeatMissDuration)
@@ -1147,8 +953,8 @@ func doLeader() {
 		timeNow                                       time.Time
 	)
 
-	if verbosityStateChanges <= globals.verbosity {
-		fmt.Printf("[%s] %s entered Leader state\n", time.Now().Format(time.RFC3339), globals.myUDPAddr)
+	if LogLevelStateChanges <= globals.logLevel {
+		logger.Infof("%s entered Leader state", globals.myUDPAddr)
 	}
 
 	heartbeatSendTime = time.Now() // Force first time through for{} loop to send a heartbeat

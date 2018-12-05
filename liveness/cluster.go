@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"hash/crc64"
 	"net"
-	"os"
 	"reflect"
 	"time"
 
@@ -169,6 +168,10 @@ func initializeGlobals(myTuple string, peerTuples []string, udpPacketSendSize ui
 
 	globals.nextState = doFollower
 
+	globals.stopStateMachineChan = make(chan struct{})
+
+	globals.stateMachineStopped = false
+
 	err = nil
 	return
 }
@@ -204,15 +207,47 @@ func dumpGlobals(indent string) {
 	fmt.Printf("%scurrentTerm:              %22v\n", indent, globals.currentTerm)
 }
 
-func shutdownSignalHandler(signalChan chan os.Signal) {
-	_ = <-signalChan
-	_ = globals.myUDPConn.Close()
+// TODO: I need a goroutine that is interruptable inside do{Candidate|Follower|Leader}()...
+func stateMachine() {
+	for {
+		globals.nextState()
+		if globals.stateMachineStopped {
+			globals.stateMachineDone.Done()
+			return
+		}
+	}
+}
+
+func activateClusterParticipation() {
+	globals.stateMachineDone.Add(1)
+	go stateMachine()
+}
+
+func deactivateClusterParticipation() {
+	var (
+		err error
+	)
+
+	// Stop state machine
+
+	globals.stopStateMachineChan <- struct{}{}
+
+	globals.stateMachineDone.Wait()
+
+	// Shut off recvMsgs()
+
+	err = globals.myUDPConn.Close()
+	if nil != err {
+		logger.Errorf("liveness.globals.myUDPConn.Close() failed: %v", err)
+	}
+
 	for {
 		select {
 		case <-globals.recvMsgChan:
 			// Just discard it
 		case <-globals.recvMsgsDoneChan:
-			os.Exit(0)
+			// Since recvMsgs() exited, we are done deactivating
+			return
 		}
 	}
 }
@@ -682,6 +717,9 @@ func doCandidate() {
 		requestVoteExpirationDurationRemaining = requestVoteExpirationTime.Sub(timeNow)
 
 		select {
+		case <-globals.stopStateMachineChan:
+			globals.stateMachineStopped = true
+			return
 		case <-globals.recvMsgChan:
 			recvMsgQueueElement = popMsg()
 			if nil != recvMsgQueueElement {
@@ -818,6 +856,9 @@ func doFollower() {
 		heartbeatMissDurationRemaining = heartbeatMissTime.Sub(timeNow)
 
 		select {
+		case <-globals.stopStateMachineChan:
+			globals.stateMachineStopped = true
+			return
 		case <-globals.recvMsgChan:
 			recvMsgQueueElement = popMsg()
 			if nil != recvMsgQueueElement {
@@ -987,6 +1028,9 @@ func doLeader() {
 		}
 
 		select {
+		case <-globals.stopStateMachineChan:
+			globals.stateMachineStopped = true
+			return
 		case <-globals.recvMsgChan:
 			recvMsgQueueElement = popMsg()
 			if nil != recvMsgQueueElement {

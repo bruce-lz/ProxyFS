@@ -5,9 +5,13 @@ import (
 	"os"
 	"os/signal"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/swiftstack/ProxyFS/conf"
 	"github.com/swiftstack/ProxyFS/transitions"
-	"golang.org/x/sys/unix"
+
+	// Force importing of liveness package
+	_ "github.com/swiftstack/ProxyFS/liveness"
 )
 
 func main() {

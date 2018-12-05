@@ -136,6 +136,9 @@ type globalsStruct struct {
 	currentVote                *peerStruct
 	currentTerm                uint64
 	nextState                  func()
+	stopStateMachineChan       chan struct{}
+	stateMachineStopped        bool
+	stateMachineDone           sync.WaitGroup
 }
 
 var globals globalsStruct
@@ -177,8 +180,25 @@ func (dummy *globalsStruct) UnserveVolume(confMap conf.ConfMap, volumeName strin
 }
 
 // SignaledStart will be used to halt the cluster leadership process. This is to support
-// SIGHUP ensuring all confMap changes are incorporated... not just during a restart.
+// SIGHUP handling incorporates all confMap changes are incorporated... not just during a restart.
 func (dummy *globalsStruct) SignaledStart(confMap conf.ConfMap) (err error) {
+	// Disable API behavior as we enter the SIGHUP-handling state
+
+	globals.active = false
+
+	// Stop participating in the cluster
+
+	deactivateClusterParticipation()
+
+	// All done
+
+	err = nil
+	return
+}
+
+// SignaledFinish will be used to kick off the cluster leadership process. This is to support
+// SIGHUP handling incorporates all confMap changes are incorporated... not just during a restart.
+func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 	var (
 		heartbeatDuration             string
 		heartbeatMissLimit            uint64
@@ -195,10 +215,6 @@ func (dummy *globalsStruct) SignaledStart(confMap conf.ConfMap) (err error) {
 		udpPacketSendSize             uint64
 		whoAmI                        string
 	)
-
-	// Disable API behavior as we enter the SIGHUP-handling state
-
-	globals.active = false
 
 	// Fetch cluster parameters
 
@@ -279,19 +295,14 @@ func (dummy *globalsStruct) SignaledStart(confMap conf.ConfMap) (err error) {
 		heartbeatDuration,
 		heartbeatMissLimit,
 		logLevel)
+	if nil != err {
+		err = fmt.Errorf("liveness.initializeGlobals() failed: %v", err)
+		return
+	}
 
-	// TODO: kick off
+	// Become an active participant in the cluster
 
-	// All done
-
-	err = nil
-	return
-}
-
-// SignaledFinish will be used to kick off the cluster leadership process. This is to support
-// SIGHUP ensuring all confMap changes are incorporated... not just during a restart.
-func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
-	// TODO halt it
+	activateClusterParticipation()
 
 	// Enable API behavior as we leave the SIGHUP-handling state
 

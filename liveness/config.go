@@ -1,6 +1,7 @@
 package liveness
 
 import (
+	"crypto/rand"
 	"fmt"
 	"hash/crc64"
 	"net"
@@ -8,7 +9,9 @@ import (
 	"time"
 
 	"github.com/swiftstack/ProxyFS/conf"
+	"github.com/swiftstack/ProxyFS/logger"
 	"github.com/swiftstack/ProxyFS/transitions"
+	"github.com/swiftstack/cstruct"
 )
 
 const (
@@ -23,7 +26,7 @@ const (
 	UDPPacketCapPerMessageMin = uint8(1)
 	UDPPacketCapPerMessageMax = uint8(10)
 
-	UDPPacketCapPerMessageDefault = uint64(5)
+	UDPPacketCapPerMessageDefault = uint8(5)
 
 	HeartBeatDurationDefault = "1s"
 
@@ -93,7 +96,19 @@ type recvMsgQueueElementStruct struct {
 	msg     interface{} // Must be a pointer to one of the above Msg structs (other than CommonMsgHeaderStruct)
 }
 
+type volumeStruct struct {
+	name          string
+	state         string // One of const State{Alive|Dead|Unknown}
+	lastCheckTime time.Time
+}
+
+type volumeGroupStruct struct {
+	name      string
+	volumeMap map[string]*volumeStruct // Key == volumeStruct.name
+}
+
 type peerStruct struct {
+	name                    string
 	udpAddr                 *net.UDPAddr
 	curRecvMsgNonce         uint64
 	curRecvPacketCount      uint8
@@ -103,14 +118,17 @@ type peerStruct struct {
 	//                                                    Note: Since there is only a single pointer here,
 	//                                                          the total number of buffered received msgs
 	//                                                          is capped by the number of listed peers
+	volumeGroupMap map[string]*volumeGroupStruct // Key == volumeGroupStruct.name
 }
 
 type globalsStruct struct {
 	sync.Mutex                 // Protects all of globalsStruct as well as peerStruct.prevRecvMsgQueueElement
 	active                     bool
+	whoAmI                     string
 	myUDPAddr                  *net.UDPAddr
 	myUDPConn                  *net.UDPConn
-	peers                      map[string]*peerStruct // Key == peerStruct.udpAddr.String() (~= peerStruct.tuple)
+	myVolumeGroupMap           map[string]*volumeGroupStruct // Key == volumeGroupStruct.name
+	peers                      map[string]*peerStruct        // Key == peerStruct.udpAddr.String() (~= peerStruct.tuple)
 	udpPacketSendSize          uint64
 	udpPacketSendPayloadSize   uint64
 	udpPacketRecvSize          uint64
@@ -148,8 +166,60 @@ func init() {
 }
 
 func (dummy *globalsStruct) Up(confMap conf.ConfMap) (err error) {
+	var (
+		dummyMsgTypeStruct             MsgTypeStruct
+		dummyHeartBeatRequestStruct    HeartBeatRequestStruct
+		dummyHeartBeatResponseStruct   HeartBeatResponseStruct
+		dummyRequestVoteRequestStruct  RequestVoteRequestStruct
+		dummyRequestVoteResponseStruct RequestVoteResponseStruct
+		u64RandBuf                     []byte
+	)
+
 	// Ensure API behavior is disabled at startup
+
 	globals.active = false
+
+	// Do one-time initialization
+
+	globals.msgTypeBufSize, _, err = cstruct.Examine(dummyMsgTypeStruct)
+	if nil != err {
+		err = fmt.Errorf("cstruct.Examine(dummyMsgTypeStruct) failed: %v", err)
+		return
+	}
+	globals.heartBeatRequestBufSize, _, err = cstruct.Examine(dummyHeartBeatRequestStruct)
+	if nil != err {
+		err = fmt.Errorf("cstruct.Examine(dummyHeartBeatRequestStruct) failed: %v", err)
+		return
+	}
+	globals.heartBeatResponseBufSize, _, err = cstruct.Examine(dummyHeartBeatResponseStruct)
+	if nil != err {
+		err = fmt.Errorf("cstruct.Examine(dummyHeartBeatResponseStruct) failed: %v", err)
+		return
+	}
+	globals.requestVoteRequestBufSize, _, err = cstruct.Examine(dummyRequestVoteRequestStruct)
+	if nil != err {
+		err = fmt.Errorf("cstruct.Examine(dummyRequestVoteRequestStruct) failed: %v", err)
+		return
+	}
+	globals.requestVoteResponseBufSize, _, err = cstruct.Examine(dummyRequestVoteResponseStruct)
+	if nil != err {
+		err = fmt.Errorf("cstruct.Examine(dummyRequestVoteResponseStruct) failed: %v", err)
+		return
+	}
+
+	globals.crc64ECMATable = crc64.MakeTable(crc64.ECMA)
+
+	u64RandBuf = make([]byte, 8)
+	_, err = rand.Read(u64RandBuf)
+	if nil != err {
+		err = fmt.Errorf("read.Rand() failed: %v", err)
+		return
+	}
+	globals.nextNonce = deserializeU64LittleEndian(u64RandBuf)
+	if 0 == globals.nextNonce {
+		globals.nextNonce = 1
+	}
+
 	err = nil
 	return
 }
@@ -186,14 +256,29 @@ func (dummy *globalsStruct) SignaledStart(confMap conf.ConfMap) (err error) {
 
 	globals.active = false
 
-	// Stop participating in the cluster
+	// Stop state machine
 
-	deactivateClusterParticipation()
+	globals.stopStateMachineChan <- struct{}{}
 
-	// All done
+	globals.stateMachineDone.Wait()
 
-	err = nil
-	return
+	// Shut off recvMsgs()
+
+	err = globals.myUDPConn.Close()
+	if nil != err {
+		logger.Errorf("liveness.globals.myUDPConn.Close() failed: %v", err)
+	}
+
+	for {
+		select {
+		case <-globals.recvMsgChan:
+			// Just discard it
+		case <-globals.recvMsgsDoneChan:
+			// Since recvMsgs() exited, we are done deactivating
+			err = nil
+			return
+		}
+	}
 }
 
 // SignaledFinish will be used to kick off the cluster leadership process. This is to support
@@ -201,8 +286,6 @@ func (dummy *globalsStruct) SignaledStart(confMap conf.ConfMap) (err error) {
 func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 	var (
 		heartbeatDuration             string
-		heartbeatMissLimit            uint64
-		logLevel                      uint64
 		myTuple                       string
 		peer                          string
 		peers                         []string
@@ -210,10 +293,6 @@ func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 		privateClusterUDPPortAsString string
 		privateClusterUDPPortAsUint64 uint16
 		privateIPAddr                 string
-		udpPacketCapPerMessage        uint64
-		udpPacketRecvSize             uint64
-		udpPacketSendSize             uint64
-		whoAmI                        string
 	)
 
 	// Fetch cluster parameters
@@ -224,17 +303,31 @@ func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 	}
 	privateClusterUDPPortAsString = fmt.Sprintf("%d", privateClusterUDPPortAsUint64)
 
-	whoAmI, err = confMap.FetchOptionValueString("Cluster", "WhoAmI")
+	globals.whoAmI, err = confMap.FetchOptionValueString("Cluster", "WhoAmI")
 	if nil != err {
 		return
 	}
 
-	privateIPAddr, err = confMap.FetchOptionValueString("Peer:"+whoAmI, "PrivateIPAddr")
+	privateIPAddr, err = confMap.FetchOptionValueString("Peer:"+globals.whoAmI, "PrivateIPAddr")
 	if nil != err {
 		return
 	}
 
 	myTuple = net.JoinHostPort(privateIPAddr, privateClusterUDPPortAsString)
+
+	globals.myUDPAddr, err = net.ResolveUDPAddr("udp", myTuple)
+	if nil != err {
+		err = fmt.Errorf("Cannot parse myTuple (%s): %v", myTuple, err)
+		return
+	}
+
+	globals.myUDPConn, err = net.ListenUDP("udp", globals.myUDPAddr)
+	if nil != err {
+		err = fmt.Errorf("Cannot bind to myTuple (%v): %v", globals.myUDPAddr, err)
+		return
+	}
+
+	globals.myVolumeGroupMap = make(map[string]*volumeGroupStruct)
 
 	peers, err = confMap.FetchOptionValueStringSlice("Cluster", "Peers")
 	if nil != err {
@@ -245,7 +338,7 @@ func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 		peerTuples = make([]string, 0, len(peers)-1)
 
 		for _, peer = range peers {
-			if peer != whoAmI {
+			if peer != globals.whoAmI {
 				privateIPAddr, err = confMap.FetchOptionValueString("Peer:"+peer, "PrivateIPAddr")
 				if nil != err {
 					return
@@ -258,55 +351,149 @@ func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 		peerTuples = make([]string, 0)
 	}
 
-	udpPacketSendSize, err = confMap.FetchOptionValueUint64("Cluster", "UDPPacketSendSize")
+	globals.udpPacketSendSize, err = confMap.FetchOptionValueUint64("Cluster", "UDPPacketSendSize")
 	if nil != err {
-		udpPacketSendSize = UDPPacketSendSizeDefault // TODO: Eventually just return
+		globals.udpPacketSendSize = UDPPacketSendSizeDefault // TODO: Eventually just return
 	}
-	udpPacketRecvSize, err = confMap.FetchOptionValueUint64("Cluster", "UDPPacketRecvSize")
+	if (globals.udpPacketSendSize < UDPPacketSizeMin) || (globals.udpPacketSendSize > UDPPacketSizeMax) {
+		err = fmt.Errorf("udpPacketSendSize (%v) must be between %v and %v (inclusive)", globals.udpPacketSendSize, UDPPacketSizeMin, UDPPacketSizeMax)
+		return
+	}
+
+	globals.udpPacketSendPayloadSize = globals.udpPacketSendSize - udpPacketHeaderSize
+
+	globals.udpPacketRecvSize, err = confMap.FetchOptionValueUint64("Cluster", "UDPPacketRecvSize")
 	if nil != err {
-		udpPacketRecvSize = UDPPacketRecvSizeDefault // TODO: Eventually just return
+		globals.udpPacketRecvSize = UDPPacketRecvSizeDefault // TODO: Eventually just return
 	}
-	udpPacketCapPerMessage, err = confMap.FetchOptionValueUint64("Cluster", "UDPPacketCapPerMessage")
+	if (globals.udpPacketRecvSize < UDPPacketSizeMin) || (globals.udpPacketRecvSize > UDPPacketSizeMax) {
+		err = fmt.Errorf("udpPacketRecvSize (%v) must be between %v and %v (inclusive)", globals.udpPacketRecvSize, UDPPacketSizeMin, UDPPacketSizeMax)
+		return
+	}
+
+	globals.udpPacketRecvPayloadSize = globals.udpPacketRecvSize - udpPacketHeaderSize
+
+	globals.udpPacketCapPerMessage, err = confMap.FetchOptionValueUint8("Cluster", "UDPPacketCapPerMessage")
 	if nil != err {
-		udpPacketCapPerMessage = UDPPacketCapPerMessageDefault // TODO: Eventually just return
+		globals.udpPacketCapPerMessage = UDPPacketCapPerMessageDefault // TODO: Eventually just return
 	}
+	if (globals.udpPacketCapPerMessage < UDPPacketCapPerMessageMin) || (globals.udpPacketCapPerMessage > UDPPacketCapPerMessageMax) {
+		err = fmt.Errorf("udpPacketCapPerMessage (%v) must be between %v and %v (inclusive)", globals.udpPacketCapPerMessage, UDPPacketCapPerMessageMin, UDPPacketCapPerMessageMax)
+		return
+	}
+
+	globals.sendMsgMessageSizeMax = uint64(globals.udpPacketCapPerMessage) * globals.udpPacketSendPayloadSize
+
 	heartbeatDuration, err = confMap.FetchOptionValueString("Cluster", "HeartBeatDuration")
 	if nil != err {
 		heartbeatDuration = HeartBeatDurationDefault // TODO: Eventually just return
 	}
-	heartbeatMissLimit, err = confMap.FetchOptionValueUint64("Cluster", "HeartBeatMissLimit")
+	globals.heartbeatDuration, err = time.ParseDuration(heartbeatDuration)
 	if nil != err {
-		heartbeatMissLimit = HeartBeatMissLimitDefault // TODO: Eventually just return
+		err = fmt.Errorf("heartbeatDuration (%s) parsing error: %v", heartbeatDuration, err)
+		return
 	}
-	logLevel, err = confMap.FetchOptionValueUint64("Cluster", "LogLevel")
-	if nil != err {
-		// Just assume we want the Default (None) LogLevel
-		logLevel = LogLevelDefault
+	if time.Duration(0) == globals.heartbeatDuration {
+		err = fmt.Errorf("heartbeatDuration must be non-zero")
+		return
 	}
 
-	// Initialize globals
+	globals.heartbeatMissLimit, err = confMap.FetchOptionValueUint64("Cluster", "HeartBeatMissLimit")
+	if nil != err {
+		globals.heartbeatMissLimit = HeartBeatMissLimitDefault // TODO: Eventually just return
+	}
+	if globals.heartbeatMissLimit < HeartBeatMissLimitMin {
+		err = fmt.Errorf("heartbeatMissLimit (%v) must be at least %v", globals.heartbeatMissLimit, HeartBeatMissLimitMin)
+		return
+	}
 
-	err = initializeGlobals(
+	globals.heartbeatMissDuration = time.Duration(globals.heartbeatMissLimit) * globals.heartbeatDuration
+
+	// Set LogLevel as specified or use default
+
+	globals.logLevel, err = confMap.FetchOptionValueUint64("Cluster", "LogLevel")
+	if nil != err {
+		globals.logLevel = LogLevelDefault
+	}
+	if globals.logLevel > LogLevelMax {
+		err = fmt.Errorf("logLevel (%v) must be between 0 and %v (inclusive)", globals.logLevel, LogLevelMax)
+		return
+	}
+
+	// Initialize remaining globals
+
+	err = initializeGlobalsOldWay(
 		myTuple,
-		peerTuples,
-		udpPacketSendSize,
-		udpPacketRecvSize,
-		udpPacketCapPerMessage,
-		heartbeatDuration,
-		heartbeatMissLimit,
-		logLevel)
+		peerTuples)
 	if nil != err {
 		err = fmt.Errorf("liveness.initializeGlobals() failed: %v", err)
 		return
 	}
 
+	globals.recvMsgQueueHead = nil
+	globals.recvMsgQueueTail = nil
+
+	globals.recvMsgChan = make(chan struct{})
+
+	globals.recvMsgsDoneChan = make(chan struct{})
+	go recvMsgs()
+
+	globals.currentLeader = nil
+	globals.currentVote = nil
+	globals.currentTerm = 0
+
+	globals.nextState = doFollower
+
+	globals.stopStateMachineChan = make(chan struct{})
+
+	globals.stateMachineStopped = false
+
 	// Become an active participant in the cluster
 
-	activateClusterParticipation()
+	globals.stateMachineDone.Add(1)
+	go stateMachine()
 
 	// Enable API behavior as we leave the SIGHUP-handling state
 
-	globals.active = false
+	globals.active = true
+
+	err = nil
+	return
+}
+
+func initializeGlobalsOldWay(myTuple string, peerTuples []string) (err error) {
+	var (
+		ok        bool
+		peer      *peerStruct
+		peerTuple string
+	)
+
+	globals.peers = make(map[string]*peerStruct)
+
+	for _, peerTuple = range peerTuples {
+		peer = &peerStruct{
+			curRecvMsgNonce:         0,
+			curRecvPacketCount:      0,
+			curRecvPacketSumSize:    0,
+			curRecvPacketMap:        nil,
+			prevRecvMsgQueueElement: nil,
+		}
+		peer.udpAddr, err = net.ResolveUDPAddr("udp", peerTuple)
+		if nil != err {
+			err = fmt.Errorf("Cannot parse peerTuple (%s): %v", peerTuple, err)
+			return
+		}
+		if globals.myUDPAddr.String() == peer.udpAddr.String() {
+			err = fmt.Errorf("peerTuples must not contain myTuple (%v)", globals.myUDPAddr)
+			return
+		}
+		_, ok = globals.peers[peer.udpAddr.String()]
+		if ok {
+			err = fmt.Errorf("peerTuples must not contain duplicate peers (%v)", peer.udpAddr)
+			return
+		}
+		globals.peers[peer.udpAddr.String()] = peer
+	}
 
 	err = nil
 	return

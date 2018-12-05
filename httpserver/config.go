@@ -19,9 +19,6 @@ import (
 	_ "github.com/swiftstack/ProxyFS/fuse"
 	_ "github.com/swiftstack/ProxyFS/jrpcfs"
 	_ "github.com/swiftstack/ProxyFS/statslogger"
-
-	// UNDO once httpserver calls liveness
-	_ "github.com/swiftstack/ProxyFS/liveness"
 )
 
 type ExtentMapElementStruct struct {

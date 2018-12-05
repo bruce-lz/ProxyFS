@@ -20,6 +20,7 @@ import (
 	"github.com/swiftstack/ProxyFS/halter"
 	"github.com/swiftstack/ProxyFS/headhunter"
 	"github.com/swiftstack/ProxyFS/inode"
+	"github.com/swiftstack/ProxyFS/liveness"
 	"github.com/swiftstack/ProxyFS/logger"
 	"github.com/swiftstack/ProxyFS/stats"
 	"github.com/swiftstack/ProxyFS/utils"
@@ -145,6 +146,8 @@ func doGet(responseWriter http.ResponseWriter, request *http.Request) {
 		responseWriter.Header().Set("Content-Type", jsontreeDotJSContentType)
 		responseWriter.WriteHeader(http.StatusOK)
 		_, _ = responseWriter.Write([]byte(jsontreeDotJSContent))
+	case "/liveness" == path:
+		doGetOfLiveness(responseWriter, request)
 	case "/metrics" == path:
 		doGetOfMetrics(responseWriter, request)
 	case "/stats" == path:
@@ -265,6 +268,50 @@ func doGetOfConfig(responseWriter http.ResponseWriter, request *http.Request) {
 		responseWriter.WriteHeader(http.StatusOK)
 
 		_, _ = responseWriter.Write([]byte(fmt.Sprintf(configTemplate, version.ProxyFSVersion, globals.ipAddrTCPPort, utils.ByteSliceToString(confMapJSONPacked))))
+	}
+}
+
+func doGetOfLiveness(responseWriter http.ResponseWriter, request *http.Request) {
+	var (
+		ok                 bool
+		paramList          []string
+		reportAsJSON       bytes.Buffer
+		reportAsJSONPacked []byte
+		reportAsStruct     *liveness.ReportStruct
+		sendPackedReport   bool
+	)
+
+	// TODO: For now, assume JSON reponse requested
+
+	reportAsStruct = liveness.FetchReport()
+
+	if nil == reportAsStruct {
+		responseWriter.WriteHeader(http.StatusServiceUnavailable)
+		return
+	}
+
+	reportAsJSONPacked, _ = json.Marshal(reportAsStruct)
+
+	responseWriter.Header().Set("Content-Type", "application/json")
+	responseWriter.WriteHeader(http.StatusOK)
+
+	paramList, ok = request.URL.Query()["compact"]
+	if ok {
+		if 0 == len(paramList) {
+			sendPackedReport = false
+		} else {
+			sendPackedReport = !((paramList[0] == "") || (paramList[0] == "0") || (paramList[0] == "false"))
+		}
+	} else {
+		sendPackedReport = false
+	}
+
+	if sendPackedReport {
+		_, _ = responseWriter.Write(reportAsJSONPacked)
+	} else {
+		json.Indent(&reportAsJSON, reportAsJSONPacked, "", "\t")
+		_, _ = responseWriter.Write(reportAsJSON.Bytes())
+		_, _ = responseWriter.Write([]byte("\n"))
 	}
 }
 
@@ -514,6 +561,13 @@ func doGetOfTrigger(responseWriter http.ResponseWriter, request *http.Request) {
 
 	switch numPathParts {
 	case 1:
+		// Ensure Path is exactly "trigger"
+
+		if "trigger" != pathSplit[1] {
+			responseWriter.WriteHeader(http.StatusNotFound)
+			return
+		}
+
 		// Form: /trigger[?armed={true|false}]
 
 		haltTriggerArmedStateAsString = request.FormValue("armed")
@@ -676,6 +730,13 @@ func doGetOfVolume(responseWriter http.ResponseWriter, request *http.Request) {
 		responseWriter.WriteHeader(http.StatusNotFound)
 		return
 	case 1:
+		// Ensure Path is exactly "volume"
+
+		if "trigger" != pathSplit[1] {
+			responseWriter.WriteHeader(http.StatusNotFound)
+			return
+		}
+
 		// Form: /volume
 	case 2:
 		responseWriter.WriteHeader(http.StatusNotFound)

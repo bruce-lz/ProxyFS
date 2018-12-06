@@ -11,7 +11,6 @@ import (
 	"github.com/swiftstack/ProxyFS/conf"
 	"github.com/swiftstack/ProxyFS/logger"
 	"github.com/swiftstack/ProxyFS/transitions"
-	"github.com/swiftstack/cstruct"
 )
 
 const (
@@ -42,7 +41,6 @@ const (
 	LogLevelDefault = LogLevelNone
 )
 
-// Every msg is cstruct-encoded in cstruct.LittleEndian byte order
 // Each UDP Packet Header is made up of (also in LittleEndian byte order):
 //   CRC64       uint64
 //   MsgNonce    uint64
@@ -51,10 +49,12 @@ const (
 
 const udpPacketHeaderSize uint64 = 8 + 8 + 1 + 1 // sizeof(CRC64) + sizeof(MsgNonce) + sizeof(PacketIndex) + sizeof(PacketCount)
 
+// Every msg is JSON-encoded
+
 type MsgType uint8
 
 const (
-	MsgTypeHeartBeatRequest MsgType = iota
+	MsgTypeHeartBeatRequest MsgType = iota + 1 // Skip zero to avoid msg's missing the MsgType field
 	MsgTypeHeartBeatResponse
 	MsgTypeRequestVoteRequest
 	MsgTypeRequestVoteResponse
@@ -147,43 +147,38 @@ type internalReportStruct struct {
 }
 
 type globalsStruct struct {
-	sync.Mutex                 // Protects all of globalsStruct as well as peerStruct.prevRecvMsgQueueElement
-	active                     bool
-	whoAmI                     string
-	myUDPAddr                  *net.UDPAddr
-	myUDPConn                  *net.UDPConn
-	myVolumeGroupMap           map[string]*volumeGroupStruct // Key == volumeGroupStruct.name
-	peers                      map[string]*peerStruct        // Key == peerStruct.udpAddr.String() (~= peerStruct.tuple)
-	udpPacketSendSize          uint64
-	udpPacketSendPayloadSize   uint64
-	udpPacketRecvSize          uint64
-	udpPacketRecvPayloadSize   uint64
-	udpPacketCapPerMessage     uint8
-	sendMsgMessageSizeMax      uint64
-	heartbeatDuration          time.Duration
-	heartbeatMissLimit         uint64
-	heartbeatMissDuration      time.Duration
-	logLevel                   uint64
-	msgTypeBufSize             uint64
-	heartBeatRequestBufSize    uint64
-	heartBeatResponseBufSize   uint64
-	requestVoteRequestBufSize  uint64
-	requestVoteResponseBufSize uint64
-	crc64ECMATable             *crc64.Table
-	nextNonce                  uint64 // Randomly initialized... skips 0
-	recvMsgsDoneChan           chan struct{}
-	recvMsgQueueHead           *recvMsgQueueElementStruct
-	recvMsgQueueTail           *recvMsgQueueElementStruct
-	recvMsgChan                chan struct{}
-	currentLeader              *peerStruct
-	currentVote                *peerStruct
-	currentTerm                uint64
-	nextState                  func()
-	stopStateMachineChan       chan struct{}
-	stateMachineStopped        bool
-	stateMachineDone           sync.WaitGroup
-	myObservingPeerReport      *internalObservingPeerReportStruct
-	livenessReport             *internalReportStruct
+	sync.Mutex               // Protects all of globalsStruct as well as peerStruct.prevRecvMsgQueueElement
+	active                   bool
+	whoAmI                   string
+	myUDPAddr                *net.UDPAddr
+	myUDPConn                *net.UDPConn
+	myVolumeGroupMap         map[string]*volumeGroupStruct // Key == volumeGroupStruct.name
+	peers                    map[string]*peerStruct        // Key == peerStruct.udpAddr.String() (~= peerStruct.tuple)
+	udpPacketSendSize        uint64
+	udpPacketSendPayloadSize uint64
+	udpPacketRecvSize        uint64
+	udpPacketRecvPayloadSize uint64
+	udpPacketCapPerMessage   uint8
+	sendMsgMessageSizeMax    uint64
+	heartbeatDuration        time.Duration
+	heartbeatMissLimit       uint64
+	heartbeatMissDuration    time.Duration
+	logLevel                 uint64
+	crc64ECMATable           *crc64.Table
+	nextNonce                uint64 // Randomly initialized... skips 0
+	recvMsgsDoneChan         chan struct{}
+	recvMsgQueueHead         *recvMsgQueueElementStruct
+	recvMsgQueueTail         *recvMsgQueueElementStruct
+	recvMsgChan              chan struct{}
+	currentLeader            *peerStruct
+	currentVote              *peerStruct
+	currentTerm              uint64
+	nextState                func()
+	stopStateMachineChan     chan struct{}
+	stateMachineStopped      bool
+	stateMachineDone         sync.WaitGroup
+	myObservingPeerReport    *internalObservingPeerReportStruct
+	livenessReport           *internalReportStruct
 }
 
 var globals globalsStruct
@@ -194,12 +189,7 @@ func init() {
 
 func (dummy *globalsStruct) Up(confMap conf.ConfMap) (err error) {
 	var (
-		dummyMsgTypeStruct             MsgTypeStruct
-		dummyHeartBeatRequestStruct    HeartBeatRequestStruct
-		dummyHeartBeatResponseStruct   HeartBeatResponseStruct
-		dummyRequestVoteRequestStruct  RequestVoteRequestStruct
-		dummyRequestVoteResponseStruct RequestVoteResponseStruct
-		u64RandBuf                     []byte
+		u64RandBuf []byte
 	)
 
 	// Ensure API behavior is disabled at startup
@@ -207,32 +197,6 @@ func (dummy *globalsStruct) Up(confMap conf.ConfMap) (err error) {
 	globals.active = false
 
 	// Do one-time initialization
-
-	globals.msgTypeBufSize, _, err = cstruct.Examine(dummyMsgTypeStruct)
-	if nil != err {
-		err = fmt.Errorf("cstruct.Examine(dummyMsgTypeStruct) failed: %v", err)
-		return
-	}
-	globals.heartBeatRequestBufSize, _, err = cstruct.Examine(dummyHeartBeatRequestStruct)
-	if nil != err {
-		err = fmt.Errorf("cstruct.Examine(dummyHeartBeatRequestStruct) failed: %v", err)
-		return
-	}
-	globals.heartBeatResponseBufSize, _, err = cstruct.Examine(dummyHeartBeatResponseStruct)
-	if nil != err {
-		err = fmt.Errorf("cstruct.Examine(dummyHeartBeatResponseStruct) failed: %v", err)
-		return
-	}
-	globals.requestVoteRequestBufSize, _, err = cstruct.Examine(dummyRequestVoteRequestStruct)
-	if nil != err {
-		err = fmt.Errorf("cstruct.Examine(dummyRequestVoteRequestStruct) failed: %v", err)
-		return
-	}
-	globals.requestVoteResponseBufSize, _, err = cstruct.Examine(dummyRequestVoteResponseStruct)
-	if nil != err {
-		err = fmt.Errorf("cstruct.Examine(dummyRequestVoteResponseStruct) failed: %v", err)
-		return
-	}
 
 	globals.crc64ECMATable = crc64.MakeTable(crc64.ECMA)
 

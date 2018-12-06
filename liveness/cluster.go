@@ -2,13 +2,12 @@ package liveness
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"hash/crc64"
 	"net"
 	"reflect"
 	"time"
-
-	"github.com/swiftstack/cstruct"
 
 	"github.com/swiftstack/ProxyFS/logger"
 )
@@ -250,7 +249,7 @@ func recvMsgs() {
 
 			msgTypeStruct = MsgTypeStruct{}
 
-			_, err = cstruct.Unpack(msgBuf, &msgTypeStruct, cstruct.LittleEndian)
+			err = json.Unmarshal(msgBuf, &msgTypeStruct)
 			if nil != err {
 				continue // Ignore it
 			}
@@ -264,30 +263,18 @@ func recvMsgs() {
 
 			switch msgTypeStruct.MsgType {
 			case MsgTypeHeartBeatRequest:
-				if uint64(len(msgBuf)) != globals.heartBeatRequestBufSize {
-					continue // Ignore it
-				}
 				recvMsgQueueElement.msg = &HeartBeatRequestStruct{}
 			case MsgTypeHeartBeatResponse:
-				if uint64(len(msgBuf)) != globals.heartBeatResponseBufSize {
-					continue // Ignore it
-				}
 				recvMsgQueueElement.msg = &HeartBeatResponseStruct{}
 			case MsgTypeRequestVoteRequest:
-				if uint64(len(msgBuf)) != globals.requestVoteRequestBufSize {
-					continue // Ignore it
-				}
 				recvMsgQueueElement.msg = &RequestVoteRequestStruct{}
 			case MsgTypeRequestVoteResponse:
-				if uint64(len(msgBuf)) != globals.requestVoteResponseBufSize {
-					continue // Ignore it
-				}
 				recvMsgQueueElement.msg = &RequestVoteResponseStruct{}
 			default:
 				continue // Ignore it
 			}
 
-			_, err = cstruct.Unpack(msgBuf, recvMsgQueueElement.msg, cstruct.LittleEndian)
+			err = json.Unmarshal(msgBuf, recvMsgQueueElement.msg)
 			if nil != err {
 				continue // Ignore it
 			}
@@ -352,7 +339,7 @@ func sendMsg(peer *peerStruct, msg interface{}) (peers []*peerStruct, err error)
 
 	msgNonce = fetchNonce()
 
-	msgBuf, err = cstruct.Pack(msg, cstruct.LittleEndian)
+	msgBuf, err = json.Marshal(msg)
 	if nil != err {
 		return
 	}

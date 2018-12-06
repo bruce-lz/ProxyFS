@@ -15,17 +15,22 @@ type VolumeStruct struct {
 }
 
 type VolumeGroupStruct struct {
-	Name        string
-	VolumeGroup []*VolumeStruct
+	Name   string
+	Volume []*VolumeStruct
 }
 
-type PeerStruct struct {
+type ServingPeerStruct struct {
 	Name        string
 	VolumeGroup []*VolumeGroupStruct
 }
 
+type ObservingPeerStruct struct {
+	Name        string
+	ServingPeer []*ServingPeerStruct
+}
+
 type ReportStruct struct {
-	Peer []*PeerStruct
+	ObservingPeer []*ObservingPeerStruct
 }
 
 func FetchReport() (report *ReportStruct) {

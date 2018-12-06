@@ -121,6 +121,31 @@ type peerStruct struct {
 	volumeGroupMap map[string]*volumeGroupStruct // Key == volumeGroupStruct.name
 }
 
+type internalVolumeReportStruct struct {
+	name          string
+	state         string // One of const State{Alive|Dead|Unknown}
+	lastCheckTime time.Time
+}
+
+type internalVolumeGroupReportStruct struct {
+	name   string
+	volume map[string]*internalVolumeReportStruct // Key = internalVolumeReportStruct.name
+}
+
+type internalServingPeerReportStruct struct {
+	name        string
+	volumeGroup map[string]*internalVolumeGroupReportStruct // Key = internalVolumeGroupReportStruct.name
+}
+
+type internalObservingPeerReportStruct struct {
+	name        string
+	servingPeer map[string]*internalServingPeerReportStruct // Key = internalServingPeerReportStruct.name
+}
+
+type internalReportStruct struct {
+	observingPeer map[string]*internalObservingPeerReportStruct // Key = internalObservingPeerReportStruct.name
+}
+
 type globalsStruct struct {
 	sync.Mutex                 // Protects all of globalsStruct as well as peerStruct.prevRecvMsgQueueElement
 	active                     bool
@@ -157,6 +182,8 @@ type globalsStruct struct {
 	stopStateMachineChan       chan struct{}
 	stateMachineStopped        bool
 	stateMachineDone           sync.WaitGroup
+	myObservingPeerReport      *internalObservingPeerReportStruct
+	livenessReport             *internalReportStruct
 }
 
 var globals globalsStruct
@@ -447,6 +474,11 @@ func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 	globals.stopStateMachineChan = make(chan struct{})
 
 	globals.stateMachineStopped = false
+
+	// Initialize internal Liveness Report data as being empty
+
+	globals.myObservingPeerReport = nil
+	globals.livenessReport = nil
 
 	// Become an active participant in the cluster
 

@@ -2,14 +2,14 @@ package liveness
 
 func fetchReport() (report *ReportStruct) {
 	var (
-		observingPeer               *ObservingPeerStruct
 		internalObservingPeerReport *internalObservingPeerReportStruct
-		servingPeer                 *ServingPeerStruct
 		internalServingPeerReport   *internalServingPeerReportStruct
-		volumeGroup                 *VolumeGroupStruct
 		internalVolumeGroupReport   *internalVolumeGroupReportStruct
-		volume                      *VolumeStruct
 		internalVolumeReport        *internalVolumeReportStruct
+		observingPeer               *ObservingPeerStruct
+		servingPeer                 *ServingPeerStruct
+		volume                      *VolumeStruct
+		volumeGroup                 *VolumeGroupStruct
 	)
 
 	globals.Lock()

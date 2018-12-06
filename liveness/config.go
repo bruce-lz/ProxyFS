@@ -1,6 +1,7 @@
 package liveness
 
 import (
+	"container/list"
 	"crypto/rand"
 	"fmt"
 	"hash/crc64"
@@ -32,6 +33,12 @@ const (
 	HeartBeatMissLimitMin     = uint64(2)
 	HeartBeatMissLimitDefault = uint64(3)
 
+	MessageQueueDepthPerPeerMin     = uint64(1)
+	MessageQueueDepthPerPeerDefault = uint64(4)
+
+	LivenessCheckRedundancyMin     = uint64(1)
+	LivenessCheckRedundancyDefault = uint64(2)
+
 	LogLevelNone           = uint64(0)
 	LogLevelStateChanges   = uint64(1)
 	LogLevelMessages       = uint64(2)
@@ -58,6 +65,8 @@ const (
 	MsgTypeHeartBeatResponse
 	MsgTypeRequestVoteRequest
 	MsgTypeRequestVoteResponse
+	MsgTypeFetchLivenessReportRequest
+	MsgTypeFetchLivenessReportResponse
 )
 
 type MsgTypeStruct struct {
@@ -68,6 +77,7 @@ type HeartBeatRequestStruct struct {
 	MsgType    MsgType // == MsgTypeHeartBeatRequest
 	LeaderTerm uint64
 	Nonce      uint64
+	Observed   *ObservingPeerStruct // VolumeStruct.State & VolumeStruct.LastCheckTime are ignored
 }
 
 type HeartBeatResponseStruct struct {
@@ -75,6 +85,7 @@ type HeartBeatResponseStruct struct {
 	CurrentTerm uint64
 	Nonce       uint64
 	Success     bool
+	Observed    *ObservingPeerStruct
 }
 
 type RequestVoteRequestStruct struct {
@@ -88,23 +99,32 @@ type RequestVoteResponseStruct struct {
 	VoteGranted bool
 }
 
-type recvMsgQueueElementStruct struct {
-	next    *recvMsgQueueElementStruct
-	prev    *recvMsgQueueElementStruct
-	peer    *peerStruct
-	msgType MsgType     // Even though it's inside msg, make it easier to decode
-	msg     interface{} // Must be a pointer to one of the above Msg structs (other than CommonMsgHeaderStruct)
+type FetchLivenessReportRequestStruct struct {
+	MsgType MsgType // == MsgTypeFetchLivenessReportRequest
+	//                 Used to request Liveness Report from who we think is the Leader
 }
 
-type volumeStruct struct {
-	name          string
-	state         string // One of const State{Alive|Dead|Unknown}
-	lastCheckTime time.Time
+type FetchLivenessReportResponseStruct struct {
+	MsgType MsgType       // == MsgTypeFetchLivenessReportResponse
+	Success bool          // == true if Leader is responding; == false if we are not the Leader
+	Report  *ReportStruct // Liveness Report as collected by Leader
+}
+
+type recvMsgQueueElementStruct struct {
+	peer                      *peerStruct
+	msgNonce                  uint64
+	packetCount               uint8
+	packetSumSize             uint64
+	packetMap                 map[uint8][]byte // Key == PacketIndex
+	peerRecvMsgQueueElement   *list.Element
+	globalRecvMsgQueueElement *list.Element
+	msgType                   MsgType     // Even though it's inside msg, make it easier to decode
+	msg                       interface{} // Must be a pointer to one of the above Msg structs (other than CommonMsgHeaderStruct)
 }
 
 type volumeGroupStruct struct {
 	name      string
-	volumeMap map[string]*volumeStruct // Key == volumeStruct.name
+	volumeMap map[string]struct{} // Key == volume name
 }
 
 type peerStruct struct {
@@ -113,12 +133,12 @@ type peerStruct struct {
 	curRecvMsgNonce         uint64
 	curRecvPacketCount      uint8
 	curRecvPacketSumSize    uint64
-	curRecvPacketMap        map[uint8][]byte           // Key is PacketIndex
-	prevRecvMsgQueueElement *recvMsgQueueElementStruct // Protected by globalsStruct.sync.Mutex
-	//                                                    Note: Since there is only a single pointer here,
-	//                                                          the total number of buffered received msgs
-	//                                                          is capped by the number of listed peers
-	volumeGroupMap map[string]*volumeGroupStruct // Key == volumeGroupStruct.name
+	curRecvPacketMap        map[uint8][]byte // Key is PacketIndex
+	prevRecvMsgQueueElement *recvMsgQueueElementStruct
+	incompleteRecvMsgMap    map[uint64]*recvMsgQueueElementStruct // Key == recvMsgQueueElementStruct.msgNonce
+	incompleteRecvMsgQueue  *list.List                            // LRU ordered
+	completeRecvMsgQueue    *list.List                            // FIFO ordered
+	volumeGroupMap          map[string]*volumeGroupStruct         // Key == volumeGroupStruct.name
 }
 
 type internalVolumeReportStruct struct {
@@ -147,13 +167,14 @@ type internalReportStruct struct {
 }
 
 type globalsStruct struct {
-	sync.Mutex               // Protects all of globalsStruct as well as peerStruct.prevRecvMsgQueueElement
+	sync.Mutex
 	active                   bool
 	whoAmI                   string
 	myUDPAddr                *net.UDPAddr
 	myUDPConn                *net.UDPConn
 	myVolumeGroupMap         map[string]*volumeGroupStruct // Key == volumeGroupStruct.name
-	peers                    map[string]*peerStruct        // Key == peerStruct.udpAddr.String() (~= peerStruct.tuple)
+	peersByName              map[string]*peerStruct        // Key == peerStruct.name
+	peersByTuple             map[string]*peerStruct        // Key == peerStruct.udpAddr.String() (~= peerStruct.tuple)
 	udpPacketSendSize        uint64
 	udpPacketSendPayloadSize uint64
 	udpPacketRecvSize        uint64
@@ -163,12 +184,13 @@ type globalsStruct struct {
 	heartbeatDuration        time.Duration
 	heartbeatMissLimit       uint64
 	heartbeatMissDuration    time.Duration
+	messageQueueDepthPerPeer uint64
+	livenessCheckRedundancy  uint64
 	logLevel                 uint64
 	crc64ECMATable           *crc64.Table
 	nextNonce                uint64 // Randomly initialized... skips 0
 	recvMsgsDoneChan         chan struct{}
-	recvMsgQueueHead         *recvMsgQueueElementStruct
-	recvMsgQueueTail         *recvMsgQueueElementStruct
+	recvMsgQueue             *list.List // FIFO ordered
 	recvMsgChan              chan struct{}
 	currentLeader            *peerStruct
 	currentVote              *peerStruct
@@ -243,6 +265,9 @@ func (dummy *globalsStruct) UnserveVolume(confMap conf.ConfMap, volumeName strin
 // SignaledStart will be used to halt the cluster leadership process. This is to support
 // SIGHUP handling incorporates all confMap changes are incorporated... not just during a restart.
 func (dummy *globalsStruct) SignaledStart(confMap conf.ConfMap) (err error) {
+	var (
+		stillDeactivating bool
+	)
 	// Disable API behavior as we enter the SIGHUP-handling state
 
 	globals.active = false
@@ -260,16 +285,35 @@ func (dummy *globalsStruct) SignaledStart(confMap conf.ConfMap) (err error) {
 		logger.Errorf("liveness.globals.myUDPConn.Close() failed: %v", err)
 	}
 
-	for {
+	stillDeactivating = true
+
+	for stillDeactivating {
 		select {
 		case <-globals.recvMsgChan:
 			// Just discard it
 		case <-globals.recvMsgsDoneChan:
 			// Since recvMsgs() exited, we are done deactivating
-			err = nil
-			return
+			stillDeactivating = false
 		}
 	}
+
+	// Free up remaining allocated resources
+
+	globals.myVolumeGroupMap = nil
+
+	globals.peersByName = nil
+	globals.peersByTuple = nil
+
+	globals.recvMsgQueue = list.New()
+
+	globals.myObservingPeerReport = nil
+	globals.livenessReport = nil
+
+	globals.myObservingPeerReport = nil
+	globals.livenessReport = nil
+
+	err = nil
+	return
 }
 
 // SignaledFinish will be used to kick off the cluster leadership process. This is to support
@@ -278,12 +322,19 @@ func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 	var (
 		heartbeatDuration             string
 		myTuple                       string
-		peer                          string
-		peers                         []string
-		peerTuples                    []string
+		ok                            bool
+		peer                          *peerStruct
+		peerName                      string
+		peerList                      []string
+		peerTuple                     string
 		privateClusterUDPPortAsString string
 		privateClusterUDPPortAsUint64 uint16
 		privateIPAddr                 string
+		volumeGroup                   *volumeGroupStruct
+		volumeGroupList               []string
+		volumeGroupName               string
+		volumeList                    []string
+		volumeName                    string
 	)
 
 	// Fetch cluster parameters
@@ -320,26 +371,60 @@ func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 
 	globals.myVolumeGroupMap = make(map[string]*volumeGroupStruct)
 
-	peers, err = confMap.FetchOptionValueStringSlice("Cluster", "Peers")
+	peerList, err = confMap.FetchOptionValueStringSlice("Cluster", "Peers")
 	if nil != err {
 		return
 	}
 
-	if 1 < len(peers) {
-		peerTuples = make([]string, 0, len(peers)-1)
+	globals.peersByName = make(map[string]*peerStruct)
+	globals.peersByTuple = make(map[string]*peerStruct)
 
-		for _, peer = range peers {
-			if peer != globals.whoAmI {
-				privateIPAddr, err = confMap.FetchOptionValueString("Peer:"+peer, "PrivateIPAddr")
-				if nil != err {
-					return
-				}
-
-				peerTuples = append(peerTuples, net.JoinHostPort(privateIPAddr, privateClusterUDPPortAsString))
+	for _, peerName = range peerList {
+		if peerName != globals.whoAmI {
+			privateIPAddr, err = confMap.FetchOptionValueString("Peer:"+peerName, "PrivateIPAddr")
+			if nil != err {
+				return
 			}
+
+			peerTuple = net.JoinHostPort(privateIPAddr, privateClusterUDPPortAsString)
+
+			peer = &peerStruct{
+				name:                    peerName,
+				curRecvMsgNonce:         0,
+				curRecvPacketCount:      0,
+				curRecvPacketSumSize:    0,
+				curRecvPacketMap:        nil,
+				prevRecvMsgQueueElement: nil,
+				incompleteRecvMsgMap:    make(map[uint64]*recvMsgQueueElementStruct),
+				incompleteRecvMsgQueue:  list.New(),
+				completeRecvMsgQueue:    list.New(),
+				volumeGroupMap:          make(map[string]*volumeGroupStruct),
+			}
+
+			peer.udpAddr, err = net.ResolveUDPAddr("udp", peerTuple)
+			if nil != err {
+				err = fmt.Errorf("Cannot parse peerTuple (%s): %v", peerTuple, err)
+				return
+			}
+
+			if globals.myUDPAddr.String() == peer.udpAddr.String() {
+				err = fmt.Errorf("peerTuple cannot match myTuple (%v)", globals.myUDPAddr)
+				return
+			}
+			_, ok = globals.peersByName[peer.name]
+			if ok {
+				err = fmt.Errorf("peerName must not match multiple peers (%v)", peer.name)
+				return
+			}
+			_, ok = globals.peersByTuple[peer.udpAddr.String()]
+			if ok {
+				err = fmt.Errorf("peerTuple must not match multiple peers (%v)", peer.udpAddr)
+				return
+			}
+
+			globals.peersByName[peer.name] = peer
+			globals.peersByTuple[peer.udpAddr.String()] = peer
 		}
-	} else {
-		peerTuples = make([]string, 0)
 	}
 
 	globals.udpPacketSendSize, err = confMap.FetchOptionValueUint64("Cluster", "UDPPacketSendSize")
@@ -400,6 +485,24 @@ func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 
 	globals.heartbeatMissDuration = time.Duration(globals.heartbeatMissLimit) * globals.heartbeatDuration
 
+	globals.messageQueueDepthPerPeer, err = confMap.FetchOptionValueUint64("Cluster", "MessageQueueDepthPerPeer")
+	if nil != err {
+		globals.messageQueueDepthPerPeer = MessageQueueDepthPerPeerDefault // TODO: Eventually just return
+	}
+	if globals.messageQueueDepthPerPeer < MessageQueueDepthPerPeerMin {
+		err = fmt.Errorf("messageQueueDepthPerPeer (%v) must be at least %v", globals.messageQueueDepthPerPeer, MessageQueueDepthPerPeerMin)
+		return
+	}
+
+	globals.livenessCheckRedundancy, err = confMap.FetchOptionValueUint64("Cluster", "LivenessCheckRedundancy")
+	if nil != err {
+		globals.livenessCheckRedundancy = LivenessCheckRedundancyDefault // TODO: Eventually just return
+	}
+	if globals.livenessCheckRedundancy < LivenessCheckRedundancyMin {
+		err = fmt.Errorf("livenessCheckRedundancy (%v) must be at least %v", globals.livenessCheckRedundancy, LivenessCheckRedundancyMin)
+		return
+	}
+
 	// Set LogLevel as specified or use default
 
 	globals.logLevel, err = confMap.FetchOptionValueUint64("Cluster", "LogLevel")
@@ -411,18 +514,66 @@ func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 		return
 	}
 
-	// Initialize remaining globals
+	// Record current Peer->VolumeGroup->Volume mapping
 
-	err = initializeGlobalsOldWay(
-		myTuple,
-		peerTuples)
+	volumeGroupList, err = confMap.FetchOptionValueStringSlice("FSGlobals", "VolumeGroupList")
 	if nil != err {
-		err = fmt.Errorf("liveness.initializeGlobals() failed: %v", err)
 		return
 	}
 
-	globals.recvMsgQueueHead = nil
-	globals.recvMsgQueueTail = nil
+	for _, volumeGroupName = range volumeGroupList {
+		volumeList, err = confMap.FetchOptionValueStringSlice("VolumeGroup:"+volumeGroupName, "VolumeList")
+		if nil != err {
+			return
+		}
+
+		peerName, err = confMap.FetchOptionValueString("VolumeGroup:"+volumeGroupName, "PrimaryPeer")
+		if nil != err {
+			return
+		}
+
+		if peerName == globals.whoAmI {
+			volumeGroup, ok = globals.myVolumeGroupMap[volumeGroupName]
+			if !ok {
+				volumeGroup = &volumeGroupStruct{
+					name:      volumeGroupName,
+					volumeMap: make(map[string]struct{}),
+				}
+
+				globals.myVolumeGroupMap[volumeGroupName] = volumeGroup
+			}
+		} else {
+			peer, ok = globals.peersByName[peerName]
+			if !ok {
+				err = fmt.Errorf("[VolumeGroup:%v]PrimaryPeer (%v) not found in [Cluster]Peers", volumeGroupName, peerName)
+				return
+			}
+
+			volumeGroup, ok = peer.volumeGroupMap[volumeGroupName]
+			if !ok {
+				volumeGroup = &volumeGroupStruct{
+					name:      volumeGroupName,
+					volumeMap: make(map[string]struct{}),
+				}
+			}
+
+			peer.volumeGroupMap[volumeGroupName] = volumeGroup
+		}
+
+		for _, volumeName = range volumeList {
+			_, ok = volumeGroup.volumeMap[volumeName]
+			if ok {
+				err = fmt.Errorf("[VolumeGroup:%v]VolumeList contains Volume %v more than once", volumeGroupName, volumeName)
+				return
+			}
+
+			volumeGroup.volumeMap[volumeName] = struct{}{}
+		}
+	}
+
+	// Initialize remaining globals
+
+	globals.recvMsgQueue = list.New()
 
 	globals.recvMsgChan = make(chan struct{})
 
@@ -452,44 +603,6 @@ func (dummy *globalsStruct) SignaledFinish(confMap conf.ConfMap) (err error) {
 	// Enable API behavior as we leave the SIGHUP-handling state
 
 	globals.active = true
-
-	err = nil
-	return
-}
-
-func initializeGlobalsOldWay(myTuple string, peerTuples []string) (err error) {
-	var (
-		ok        bool
-		peer      *peerStruct
-		peerTuple string
-	)
-
-	globals.peers = make(map[string]*peerStruct)
-
-	for _, peerTuple = range peerTuples {
-		peer = &peerStruct{
-			curRecvMsgNonce:         0,
-			curRecvPacketCount:      0,
-			curRecvPacketSumSize:    0,
-			curRecvPacketMap:        nil,
-			prevRecvMsgQueueElement: nil,
-		}
-		peer.udpAddr, err = net.ResolveUDPAddr("udp", peerTuple)
-		if nil != err {
-			err = fmt.Errorf("Cannot parse peerTuple (%s): %v", peerTuple, err)
-			return
-		}
-		if globals.myUDPAddr.String() == peer.udpAddr.String() {
-			err = fmt.Errorf("peerTuples must not contain myTuple (%v)", globals.myUDPAddr)
-			return
-		}
-		_, ok = globals.peers[peer.udpAddr.String()]
-		if ok {
-			err = fmt.Errorf("peerTuples must not contain duplicate peers (%v)", peer.udpAddr)
-			return
-		}
-		globals.peers[peer.udpAddr.String()] = peer
-	}
 
 	err = nil
 	return

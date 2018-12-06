@@ -63,61 +63,37 @@ func deserializeU64LittleEndian(u64Buf []byte) (u64 uint64) {
 	return
 }
 
-func appendRecvMsgQueueElementWhileLocked(recvMsgQueueElement *recvMsgQueueElementStruct) {
-	if nil == globals.recvMsgQueueHead { // && nil == globals.recvMsgQueueTail
-		globals.recvMsgQueueHead = recvMsgQueueElement
-		globals.recvMsgQueueTail = recvMsgQueueElement
-	} else {
-		globals.recvMsgQueueTail.next = recvMsgQueueElement
-		recvMsgQueueElement.prev = globals.recvMsgQueueTail
-		globals.recvMsgQueueTail = recvMsgQueueElement
-	}
+func appendGlobalRecvMsgQueueElementWhileLocked(recvMsgQueueElement *recvMsgQueueElementStruct) {
+	recvMsgQueueElement.globalRecvMsgQueueElement = globals.recvMsgQueue.PushBack(recvMsgQueueElement)
+}
+func appendGlobalRecvMsgQueueElement(recvMsgQueueElement *recvMsgQueueElementStruct) {
+	globals.Lock()
+	appendGlobalRecvMsgQueueElementWhileLocked(recvMsgQueueElement)
+	globals.Unlock()
 }
 
-func removeRecvMsgQueueElementWhileLocked(recvMsgQueueElement *recvMsgQueueElementStruct) {
-	if recvMsgQueueElement == globals.recvMsgQueueHead {
-		if recvMsgQueueElement == globals.recvMsgQueueTail {
-			globals.recvMsgQueueHead = nil
-			globals.recvMsgQueueTail = nil
-		} else {
-			globals.recvMsgQueueHead = globals.recvMsgQueueHead.next
-			globals.recvMsgQueueHead.prev = nil
-		}
-	} else {
-		if recvMsgQueueElement == globals.recvMsgQueueTail {
-			globals.recvMsgQueueTail = globals.recvMsgQueueTail.prev
-			globals.recvMsgQueueTail.next = nil
-		} else {
-			recvMsgQueueElement.prev.next = recvMsgQueueElement.next
-			recvMsgQueueElement.next.prev = recvMsgQueueElement.prev
-		}
-	}
+func removeGlobalRecvMsgQueueElementWhileLocked(recvMsgQueueElement *recvMsgQueueElementStruct) {
+	_ = globals.recvMsgQueue.Remove(recvMsgQueueElement.globalRecvMsgQueueElement)
+}
+func removeGlobalRecvMsgQueueElement(recvMsgQueueElement *recvMsgQueueElementStruct) {
+	globals.Lock()
+	removeGlobalRecvMsgQueueElementWhileLocked(recvMsgQueueElement)
+	globals.Unlock()
 }
 
-func popMsgWhileLocked() (recvMsgQueueElement *recvMsgQueueElementStruct) {
-	if nil == globals.recvMsgQueueHead {
+func popGlobalMsgWhileLocked() (recvMsgQueueElement *recvMsgQueueElementStruct) {
+	if 0 == globals.recvMsgQueue.Len() {
 		recvMsgQueueElement = nil
-		return
-	}
-
-	if globals.recvMsgQueueHead == globals.recvMsgQueueTail {
-		recvMsgQueueElement = globals.recvMsgQueueHead
-		globals.recvMsgQueueHead = nil
-		globals.recvMsgQueueTail = nil
 	} else {
-		recvMsgQueueElement = globals.recvMsgQueueHead
-		globals.recvMsgQueueHead = recvMsgQueueElement.next
-		recvMsgQueueElement.next = nil
+		recvMsgQueueElement = globals.recvMsgQueue.Front().Value.(*recvMsgQueueElementStruct)
+		recvMsgQueueElement.peer.completeRecvMsgQueue.Remove(recvMsgQueueElement.peerRecvMsgQueueElement)
+		removeGlobalRecvMsgQueueElementWhileLocked(recvMsgQueueElement)
 	}
-
-	recvMsgQueueElement.peer.prevRecvMsgQueueElement = nil
-
 	return
 }
-
-func popMsg() (recvMsgQueueElement *recvMsgQueueElementStruct) {
+func popGlobalMsg() (recvMsgQueueElement *recvMsgQueueElementStruct) {
 	globals.Lock()
-	recvMsgQueueElement = popMsgWhileLocked()
+	recvMsgQueueElement = popGlobalMsgWhileLocked()
 	globals.Unlock()
 	return
 }
@@ -188,7 +164,7 @@ func recvMsgs() {
 		// Locate peer
 
 		globals.Lock()
-		peer, ok = globals.peers[udpAddr.String()]
+		peer, ok = globals.peersByTuple[udpAddr.String()]
 		globals.Unlock()
 
 		if !ok {
@@ -197,53 +173,71 @@ func recvMsgs() {
 
 		// Check if packet is part of a new msg
 
-		if msgNonce != peer.curRecvMsgNonce {
-			// Forget prior msg packets and start receiving a new msg with this packet
+		recvMsgQueueElement, ok = peer.incompleteRecvMsgMap[msgNonce]
+		if ok {
+			// Packet is part of an existing incomplete msg
 
-			peer.curRecvMsgNonce = msgNonce
-			peer.curRecvPacketCount = packetCount
-			peer.curRecvPacketMap = make(map[uint8][]byte)
+			peer.incompleteRecvMsgQueue.MoveToBack(recvMsgQueueElement.peerRecvMsgQueueElement)
 
-			peer.curRecvPacketSumSize = uint64(len(packetBuf[18:]))
-			peer.curRecvPacketMap[packetIndex] = packetBuf[18:]
-		} else if packetCount != peer.curRecvPacketCount {
-			// Must be a re-used msgNonce... forget prior msg packets and start receiving a new msg with this packet
+			if packetCount != recvMsgQueueElement.packetCount {
+				// Forget prior msg packets and start receiving a new msg with this packet
 
-			peer.curRecvPacketCount = packetCount
-			peer.curRecvPacketMap = make(map[uint8][]byte)
+				recvMsgQueueElement.packetCount = packetCount
+				recvMsgQueueElement.packetSumSize = uint64(len(packetBuf[18:]))
+				recvMsgQueueElement.packetMap = make(map[uint8][]byte)
 
-			peer.curRecvPacketSumSize = uint64(len(packetBuf[18:]))
-			peer.curRecvPacketMap[packetIndex] = packetBuf[18:]
+				recvMsgQueueElement.packetMap[packetIndex] = packetBuf[18:]
+			} else {
+				// Update existing incomplete msg with this packet
+
+				_, ok = recvMsgQueueElement.packetMap[packetIndex]
+				if ok {
+					continue // Ignore it
+				}
+
+				recvMsgQueueElement.packetSumSize += uint64(len(packetBuf[18:]))
+				recvMsgQueueElement.packetMap[packetIndex] = packetBuf[18:]
+			}
 		} else {
-			// Fill-in (if not already received) this packet into current msg
+			// Packet is part of a new msg
 
-			_, ok = peer.curRecvPacketMap[packetIndex]
+			if uint64(peer.incompleteRecvMsgQueue.Len()) >= globals.messageQueueDepthPerPeer {
+				// Make room for this new msg in .incompleteRecvMsgQueue
 
-			if ok {
-				continue // Ignore it
+				recvMsgQueueElement = peer.incompleteRecvMsgQueue.Front().Value.(*recvMsgQueueElementStruct)
+				delete(peer.incompleteRecvMsgMap, recvMsgQueueElement.msgNonce)
+				_ = peer.incompleteRecvMsgQueue.Remove(recvMsgQueueElement.peerRecvMsgQueueElement)
 			}
 
-			peer.curRecvPacketSumSize += uint64(len(packetBuf[18:]))
-			peer.curRecvPacketMap[packetIndex] = packetBuf[18:]
+			// Contstruct a new recvMsgQueueElement
+
+			recvMsgQueueElement = &recvMsgQueueElementStruct{
+				peer:          peer,
+				msgNonce:      msgNonce,
+				packetCount:   packetCount,
+				packetSumSize: uint64(len(packetBuf[18:])),
+				packetMap:     make(map[uint8][]byte),
+			}
+
+			recvMsgQueueElement.packetMap[packetIndex] = packetBuf[18:]
+
+			peer.incompleteRecvMsgMap[recvMsgQueueElement.msgNonce] = recvMsgQueueElement
+			recvMsgQueueElement.peerRecvMsgQueueElement = peer.incompleteRecvMsgQueue.PushBack(recvMsgQueueElement)
 		}
 
 		// Have all packets of msg been received?
 
-		if len(peer.curRecvPacketMap) == int(packetCount) {
+		if len(recvMsgQueueElement.packetMap) == int(recvMsgQueueElement.packetCount) {
 			// All packets received... assemble completed msg
 
-			msgBuf = make([]byte, 0, peer.curRecvPacketSumSize)
+			delete(peer.incompleteRecvMsgMap, recvMsgQueueElement.msgNonce)
+			_ = peer.incompleteRecvMsgQueue.Remove(recvMsgQueueElement.peerRecvMsgQueueElement)
 
-			for packetIndex = 0; packetIndex < peer.curRecvPacketCount; packetIndex++ {
-				msgBuf = append(msgBuf, peer.curRecvPacketMap[packetIndex]...)
+			msgBuf = make([]byte, 0, recvMsgQueueElement.packetSumSize)
+
+			for packetIndex = 0; packetIndex < recvMsgQueueElement.packetCount; packetIndex++ {
+				msgBuf = append(msgBuf, recvMsgQueueElement.packetMap[packetIndex]...)
 			}
-
-			// Now discard the packets
-
-			peer.curRecvMsgNonce = 0
-			peer.curRecvPacketCount = 0
-			peer.curRecvPacketSumSize = 0
-			peer.curRecvPacketMap = nil
 
 			// Decode the msg
 
@@ -254,14 +248,9 @@ func recvMsgs() {
 				continue // Ignore it
 			}
 
-			recvMsgQueueElement = &recvMsgQueueElementStruct{
-				next:    nil,
-				prev:    nil,
-				peer:    peer,
-				msgType: msgTypeStruct.MsgType,
-			}
+			recvMsgQueueElement.msgType = msgTypeStruct.MsgType
 
-			switch msgTypeStruct.MsgType {
+			switch recvMsgQueueElement.msgType {
 			case MsgTypeHeartBeatRequest:
 				recvMsgQueueElement.msg = &HeartBeatRequestStruct{}
 			case MsgTypeHeartBeatResponse:
@@ -283,19 +272,15 @@ func recvMsgs() {
 
 			globals.Lock()
 
-			if nil != peer.prevRecvMsgQueueElement {
-				// Erase prior msg from globals.recvMsgQueue
+			recvMsgQueueElement.peerRecvMsgQueueElement = peer.completeRecvMsgQueue.PushBack(recvMsgQueueElement)
 
-				removeRecvMsgQueueElementWhileLocked(peer.prevRecvMsgQueueElement)
-			}
-
-			appendRecvMsgQueueElementWhileLocked(recvMsgQueueElement)
-
-			peer.prevRecvMsgQueueElement = recvMsgQueueElement
+			appendGlobalRecvMsgQueueElementWhileLocked(recvMsgQueueElement)
 
 			globals.Unlock()
 
 			globals.recvMsgChan <- struct{}{}
+
+			// Log delivery if requested
 
 			if LogLevelMessages <= globals.logLevel {
 				if LogLevelMessageDetails > globals.logLevel {
@@ -327,8 +312,8 @@ func sendMsg(peer *peerStruct, msg interface{}) (peers []*peerStruct, err error)
 
 	if nil == peer {
 		globals.Lock()
-		peers = make([]*peerStruct, 0, len(globals.peers))
-		for _, peer = range globals.peers {
+		peers = make([]*peerStruct, 0, len(globals.peersByTuple))
+		for _, peer = range globals.peersByTuple {
 			peers = append(peers, peer)
 		}
 		globals.Unlock()
@@ -479,7 +464,7 @@ func doCandidate() {
 			globals.stateMachineStopped = true
 			return
 		case <-globals.recvMsgChan:
-			recvMsgQueueElement = popMsg()
+			recvMsgQueueElement = popGlobalMsg()
 			if nil != recvMsgQueueElement {
 				peer = recvMsgQueueElement.peer
 				switch recvMsgQueueElement.msgType {
@@ -618,7 +603,7 @@ func doFollower() {
 			globals.stateMachineStopped = true
 			return
 		case <-globals.recvMsgChan:
-			recvMsgQueueElement = popMsg()
+			recvMsgQueueElement = popGlobalMsg()
 			if nil != recvMsgQueueElement {
 				peer = recvMsgQueueElement.peer
 				switch recvMsgQueueElement.msgType {
@@ -790,7 +775,7 @@ func doLeader() {
 			globals.stateMachineStopped = true
 			return
 		case <-globals.recvMsgChan:
-			recvMsgQueueElement = popMsg()
+			recvMsgQueueElement = popGlobalMsg()
 			if nil != recvMsgQueueElement {
 				peer = recvMsgQueueElement.peer
 				switch recvMsgQueueElement.msgType {
